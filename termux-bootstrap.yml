@@ -1,0 +1,84 @@
+---
+# termux-bootstrap.yml
+# Configures Termux's own SSH server (the actual network-facing layer on
+# the phone) with your GitHub SSH keys, and locks it down to key-only auth.
+#
+# Termux has no systemd, no sudo, and effectively one user (u0_aXXX) — so
+# this playbook doesn't create a user or grant sudo, it just secures SSH
+# access to the account you already have.
+#
+# Run it against Termux's sshd (default port 8022), authenticating with
+# your Termux password one last time before this locks it down:
+#
+#   ansible-playbook -i "192.168.1.50," -u u0_a123 -k -e ansible_port=8022 \
+#     --ask-become-pass=false termux-bootstrap.yml
+#
+# Note: `become: true` / sudo is NOT used here — Termux doesn't have it.
+# Tasks run as whatever user you connect as.
+
+- name: Bootstrap Termux SSH access with GitHub keys
+  hosts: all
+  vars:
+    github_username: johanbrandhorst
+    termux_ssh_config: "/data/data/com.termux/files/usr/etc/ssh/sshd_config"
+    # Termux's `~` resolution is unreliable across modules — resolve home
+    # explicitly once and use it everywhere instead of "~".
+    termux_home: "{{ ansible_facts.env.HOME }}"
+
+  tasks:
+    - name: Fetch public keys from GitHub
+      ansible.builtin.uri:
+        url: "https://github.com/{{ github_username }}.keys"
+        return_content: true
+      register: github_keys
+
+    - name: Fail if no keys were found
+      ansible.builtin.fail:
+        msg: "No SSH keys found for GitHub user {{ github_username }}"
+      when: github_keys.content | trim | length == 0
+
+    - name: Ensure ~/.ssh exists
+      ansible.builtin.file:
+        path: "{{ termux_home }}/.ssh"
+        state: directory
+        mode: "0700"
+
+    - name: Authorize GitHub SSH keys
+      ansible.posix.authorized_key:
+        # `user` is a required module argument, but since `path` is given
+        # explicitly, it isn't used to resolve the home directory — that's
+        # what avoids Termux's broken getpwnam() home-dir lookup.
+        user: "{{ ansible_facts.user_id }}"
+        path: "{{ termux_home }}/.ssh/authorized_keys"
+        state: present
+        key: "{{ github_keys.content }}"
+        manage_dir: false
+
+    - name: Disable SSH password authentication
+      ansible.builtin.lineinfile:
+        path: "{{ termux_ssh_config }}"
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+      notify: Restart Termux sshd
+
+    - name: Disable SSH root login (n/a, but harmless to set)
+      ansible.builtin.lineinfile:
+        path: "{{ termux_ssh_config }}"
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin no'
+      notify: Restart Termux sshd
+
+  handlers:
+    # No service manager in Termux. Killing sshd also kills the SSH
+    # connection this playbook is running over, so a synchronous
+    # `pkill; sshd` here would sever the connection before `sshd` ever
+    # runs. Instead, detach the restart into the background with a short
+    # delay, and fire-and-forget via async/poll:0 so Ansible doesn't wait
+    # on a connection that's about to close.
+    - name: Restart Termux sshd
+      ansible.builtin.shell: >
+        nohup sh -c 'sleep 1; pkill sshd; sleep 1; sshd' >/dev/null 2>&1 &
+        disown
+      async: 5
+      poll: 0
+      changed_when: true

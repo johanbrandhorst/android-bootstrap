@@ -1,0 +1,96 @@
+---
+# termux-data-setup.yml
+# Creates a persistent data directory OUTSIDE the proot container (in
+# Termux's shared storage) and a login wrapper that bind-mounts it in.
+# This is what makes the container disposable: wipe and reinstall Debian
+# as often as you like, and /data inside the container always points at
+# the same real files on the phone.
+#
+# Run this on Termux itself (not inside proot), same host as termux-bootstrap.yml.
+# Run termux-bootstrap.yml first so your GitHub key is authorized — then
+# no -k needed:
+#
+#   ansible-playbook -i "192.168.1.50," -u u0_a123 -e ansible_port=8022 \
+#     termux-data-setup.yml
+#
+# Prerequisite: run `termux-setup-storage` once by hand first and accept
+# the Android permission prompt — this can't be automated, it requires a
+# tap on the phone screen.
+
+- name: Set up persistent data directory and proot login wrapper
+  hosts: all
+  vars:
+    # Termux's `~` expansion is unreliable across modules (same root cause
+    # as the authorized_key fix in termux-bootstrap.yml) — resolve home
+    # explicitly once and use it everywhere instead of "~".
+    termux_home: "{{ ansible_facts.env.HOME }}"
+    data_dir: "{{ termux_home }}/storage/shared/phone-data"   # lives outside the proot container
+    distro: debian
+    ssh_port: 8023
+
+  tasks:
+    - name: Ensure persistent data directory exists
+      ansible.builtin.file:
+        path: "{{ data_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Create subdirectories for common data (configs, services, backups)
+      ansible.builtin.file:
+        path: "{{ data_dir }}/{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - configs
+        - services
+        - backups
+
+    - name: Create proot login wrapper with data bind-mount
+      ansible.builtin.copy:
+        dest: "{{ termux_home }}/proot-debian-login.sh"
+        mode: "0755"
+        content: |
+          #!/data/data/com.termux/files/usr/bin/sh
+          # Enters the Debian container with the persistent data dir mounted at /data.
+          # NOTE: --bind must come BEFORE the -- separator — proot-distro
+          # treats everything after -- as the command to run, not options.
+          proot-distro login {{ distro }} \
+            --bind {{ data_dir }}:/data \
+            -- /bin/bash
+
+    - name: Create boot-time sshd starter with data bind-mount
+      ansible.builtin.copy:
+        dest: "{{ termux_home }}/proot-debian-sshd-start.sh"
+        mode: "0755"
+        content: |
+          #!/data/data/com.termux/files/usr/bin/sh
+          # Starts sshd inside the container with /data bind-mounted, so
+          # anything sshd-launched processes touch under /data persists
+          # across container rebuilds.
+          proot-distro login {{ distro }} \
+            --bind {{ data_dir }}:/data \
+            -- /usr/sbin/sshd -p {{ ssh_port }}
+
+    - name: Ensure Termux:Boot directory exists
+      ansible.builtin.file:
+        path: "{{ termux_home }}/.termux/boot"
+        state: directory
+        mode: "0755"
+
+    - name: Symlink sshd starter into Termux:Boot
+      ansible.builtin.file:
+        src: "{{ termux_home }}/proot-debian-sshd-start.sh"
+        dest: "{{ termux_home }}/.termux/boot/start-proot-sshd.sh"
+        state: link
+
+# --- Usage ---
+#
+# Enter the container with data available:
+#   ~/proot-debian-login.sh
+#
+# Inside, /data/configs, /data/services, /data/backups are real files
+# living in Termux's shared storage — untouched by `proot-distro remove`.
+#
+# Requires the Termux:Boot app (F-Droid) installed for the boot script
+# to actually run on phone startup; without it, start sshd manually
+# with ~/proot-debian-sshd-start.sh after a reboot.

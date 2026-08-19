@@ -1,0 +1,169 @@
+---
+# proot-bootstrap.yml
+# Sets up a real admin user AND a directly network-reachable sshd inside
+# the proot-distro Debian guest, so you can `ssh` straight into the
+# container instead of hopping through Termux + `proot-distro login`.
+#
+# This works because proot does NOT create a network namespace — the
+# guest shares the phone's network stack with Termux/Android. So an
+# sshd bound inside the container is reachable at the phone's normal
+# IP, on whatever port you give it.
+#
+# Two things need workarounds under proot, both handled below:
+#   - PAM often fails under proot (no real /proc, cgroup, audit support)
+#     -> UsePAM no
+#   - Privilege separation can fail for the same reason on some builds
+#     -> see notes at the bottom if sshd refuses to start
+#
+# Run this locally, inside the proot shell itself (Ansible can't reach
+# the container until sshd is already up):
+#
+#   proot-distro login debian
+#   apt update && apt install -y ansible sudo
+#   ansible-playbook -c local -i localhost, proot-bootstrap.yml \
+#     -e target_user=johan -e ssh_port=8023
+
+- name: Bootstrap admin user and direct SSH access in proot Debian guest
+  hosts: all
+  connection: local
+  become: true
+  vars:
+    target_user: johan                 # override with -e target_user=whateveryouwant
+    github_username: johanbrandhorst
+    ssh_port: 8023                     # pick something that won't clash with Termux's 8022
+    config_repo: ""                    # e.g. git@github.com:johanbrandhorst/phone-configs.git
+                                        # leave blank to skip config checkout
+    config_repo_branch: main
+
+  tasks:
+    - name: Ensure sudo, openssh-server, and git are installed
+      ansible.builtin.apt:
+        name:
+          - sudo
+          - openssh-server
+          - git
+        state: present
+        update_cache: true
+
+    - name: Fetch public keys from GitHub
+      ansible.builtin.uri:
+        url: "https://github.com/{{ github_username }}.keys"
+        return_content: true
+      register: github_keys
+
+    - name: Fail if no keys were found
+      ansible.builtin.fail:
+        msg: "No SSH keys found for GitHub user {{ github_username }}"
+      when: github_keys.content | trim | length == 0
+
+    - name: Ensure admin user exists
+      ansible.builtin.user:
+        name: "{{ target_user }}"
+        shell: /bin/bash
+        create_home: true
+        groups: sudo
+        append: true
+
+    - name: Authorize GitHub SSH keys for admin user
+      ansible.posix.authorized_key:
+        user: "{{ target_user }}"
+        state: present
+        key: "{{ github_keys.content }}"
+
+    - name: Grant passwordless sudo to admin user
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/{{ target_user }}"
+        content: "{{ target_user }} ALL=(ALL) NOPASSWD:ALL\n"
+        mode: "0440"
+        validate: "visudo -cf %s"
+
+    - name: Lock the admin user's password (SSH key login only)
+      ansible.builtin.user:
+        name: "{{ target_user }}"
+        password_lock: true
+
+    - name: Generate SSH host keys if missing
+      ansible.builtin.command: ssh-keygen -A
+      args:
+        creates: /etc/ssh/ssh_host_rsa_key
+
+    - name: Configure sshd
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+      loop:
+        - { regexp: '^#?Port',                  line: "Port {{ ssh_port }}" }
+        - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication no' }
+        - { regexp: '^#?PermitRootLogin',        line: 'PermitRootLogin no' }
+        - { regexp: '^#?UsePAM',                 line: 'UsePAM no' }
+
+    - name: Check if sshd is already running
+      ansible.builtin.command: pgrep -f "sshd.*-p {{ ssh_port }}"
+      register: sshd_running
+      failed_when: false
+      changed_when: false
+
+    - name: Start sshd
+      ansible.builtin.command: /usr/sbin/sshd
+      when: sshd_running.rc != 0
+
+    - name: Check /data mount is present (requires --bind at login, see termux-data-setup.yml)
+      ansible.builtin.stat:
+        path: /data
+      register: data_mount
+      when: config_repo | length > 0
+
+    - name: Warn if /data isn't mounted
+      ansible.builtin.debug:
+        msg: >-
+          /data is not present — this container wasn't entered via the
+          bind-mount wrapper from termux-data-setup.yml. Config checkout
+          would land inside the disposable container instead of persistent
+          storage. Run this playbook via ~/proot-debian-login.sh instead.
+      when: config_repo | length > 0 and not data_mount.stat.exists
+
+    - name: Clone or update config repo into persistent storage
+      ansible.builtin.git:
+        repo: "{{ config_repo }}"
+        dest: /data/configs
+        version: "{{ config_repo_branch }}"
+      when: config_repo | length > 0 and data_mount.stat.exists
+      become: false
+      become_user: "{{ target_user }}"
+
+    - name: Symlink config repo into admin user's home
+      ansible.builtin.file:
+        src: /data/configs
+        dest: "/home/{{ target_user }}/configs"
+        state: link
+      when: config_repo | length > 0 and data_mount.stat.exists
+
+# --- Notes ---
+#
+# 1. sshd does NOT survive a reboot or a Termux/proot restart on its own
+#    — there's no init system tracking it. To auto-start it, install
+#    Termux:Boot (from F-Droid) and add a script to
+#    ~/.termux/boot/start-proot-sshd.sh:
+#
+#      #!/data/data/com.termux/files/usr/bin/sh
+#      proot-distro login debian -- /usr/sbin/sshd
+#
+#    Make it executable: chmod +x ~/.termux/boot/start-proot-sshd.sh
+#
+# 2. If sshd refuses to start, run `/usr/sbin/sshd -D -e` manually inside
+#    the proot shell to see the actual error — privilege separation is
+#    the most common failure point under proot. If so, add
+#    `UsePrivilegeSeparation no` to the sshd_config task loop above
+#    (removed in modern OpenSSH, but the config directive is harmless
+#    if unsupported — check your sshd version's behavior first).
+#
+# 3. Port choice: Termux's own sshd defaults to 8022, so this uses 8023
+#    to avoid a clash. Both will be reachable side by side at the same
+#    phone IP: :8022 for the Termux layer, :8023 for the Debian guest.
+#
+# 4. Persistent config checkout (config_repo) only works if /data is
+#    bind-mounted in — run termux-data-setup.yml first, then enter the
+#    container with ~/proot-debian-login.sh (not a bare `proot-distro
+#    login`) before running this playbook. Otherwise the git clone lands
+#    inside the disposable container and is lost on next rebuild.

@@ -1,0 +1,124 @@
+---
+# termux-auto-upgrade.yml
+# Schedules a weekly `apt update && apt upgrade` inside the proot Debian
+# guest, run from Termux via cron. Logs go to persistent storage so you
+# can check results without keeping Termux open.
+#
+# Run this on Termux, same host as termux-bootstrap.yml / termux-data-setup.yml.
+# Run termux-bootstrap.yml first so your GitHub key is authorized — then
+# no -k needed:
+#
+#   ansible-playbook -i "192.168.1.50," -u u0_a123 -e ansible_port=8022 \
+#     termux-auto-upgrade.yml
+#
+# Prerequisite: termux-data-setup.yml already run (this reuses its
+# data_dir for logs).
+
+- name: Schedule weekly apt upgrades inside proot Debian
+  hosts: all
+  vars:
+    # Same Termux `~`-resolution quirk as termux-data-setup.yml — resolve
+    # home explicitly and use it everywhere instead of "~".
+    termux_home: "{{ ansible_facts.env.HOME }}"
+    data_dir: "{{ termux_home }}/storage/shared/phone-data"
+    distro: debian
+    cron_schedule: "0 3 * * 0"   # Sunday 3am — override with -e cron_schedule="..."
+    ntfy_server: "https://ntfy.sh"        # override with -e ntfy_server=... for self-hosted
+    ntfy_topic: ""                        # required — e.g. -e ntfy_topic=pixel3a-updates
+
+  tasks:
+    - name: Install cronie, termux-services, and curl
+      ansible.builtin.command: pkg install -y cronie termux-services curl
+      args:
+        creates: "/data/data/com.termux/files/usr/bin/crond"
+
+    - name: Fail if ntfy_topic isn't set
+      ansible.builtin.fail:
+        msg: "Pass -e ntfy_topic=<your-topic> so upgrade results have somewhere to go"
+      when: ntfy_topic | length == 0
+
+    - name: Ensure log directory exists
+      ansible.builtin.file:
+        path: "{{ data_dir }}/logs"
+        state: directory
+        mode: "0755"
+
+    - name: Create apt-upgrade script
+      ansible.builtin.copy:
+        dest: "{{ termux_home }}/proot-debian-apt-upgrade.sh"
+        mode: "0755"
+        content: |
+          #!/data/data/com.termux/files/usr/bin/sh
+          # Runs apt update/upgrade inside the proot container, logs the
+          # result to persistent storage, and pushes a summary to ntfy.
+          LOG="{{ data_dir }}/logs/apt-upgrade-$(date +%Y%m%d-%H%M%S).log"
+          NTFY_URL="{{ ntfy_server }}/{{ ntfy_topic }}"
+
+          termux-wake-lock
+          proot-distro login {{ distro }} -- sh -c \
+            "apt update && apt upgrade -y && apt autoremove -y" \
+            > "$LOG" 2>&1
+          EXIT_CODE=$?
+          echo "Exit code: $EXIT_CODE" >> "$LOG"
+          termux-wake-unlock
+
+          if [ "$EXIT_CODE" -eq 0 ]; then
+            UPGRADED=$(grep -c '^Setting up ' "$LOG" 2>/dev/null || echo 0)
+            curl -s \
+              -H "Title: proot Debian: upgrade OK" \
+              -H "Tags: white_check_mark" \
+              -d "$UPGRADED package(s) updated. Log: $(basename "$LOG")" \
+              "$NTFY_URL"
+          else
+            curl -s \
+              -H "Title: proot Debian: upgrade FAILED" \
+              -H "Priority: high" \
+              -H "Tags: x" \
+              -d "Exit code $EXIT_CODE. Check $(basename "$LOG")" \
+              "$NTFY_URL"
+          fi
+
+    - name: Enable crond via termux-services
+      ansible.builtin.command: sv-enable crond
+      args:
+        creates: "{{ termux_home }}/.termux/service/crond"
+
+    - name: Ensure crond service is running
+      ansible.builtin.command: sv up crond
+      changed_when: false
+
+    - name: Install weekly cron job for apt upgrade
+      ansible.builtin.cron:
+        name: "proot debian weekly apt upgrade"
+        minute: "{{ cron_schedule.split(' ')[0] }}"
+        hour: "{{ cron_schedule.split(' ')[1] }}"
+        weekday: "{{ cron_schedule.split(' ')[4] }}"
+        job: "{{ termux_home }}/proot-debian-apt-upgrade.sh"
+
+# --- Notes ---
+#
+# 0. Uses a plain HTTP POST to ntfy — no extra app or auth required for
+#    the default public ntfy.sh server, just pick a topic name only you
+#    know (topics on ntfy.sh are unauthenticated by default: anyone who
+#    guesses/knows the topic name can read it, so avoid anything
+#    sensitive in the message, or point ntfy_server at a self-hosted /
+#    authenticated instance if that matters to you).
+#
+# 1. Reliability under Android's Doze/battery optimization: cron only
+#    fires if Termux's process (specifically crond, run via termux-services)
+#    is still alive. Make sure you've already disabled battery optimization
+#    for Termux (Settings -> Apps -> Termux -> Battery -> Unrestricted) —
+#    covered in the original setup steps. Without that, Doze can suspend
+#    crond and silently skip runs, especially on Pixel hardware which is
+#    aggressive about background process killing.
+#
+# 2. Checking results: log files land in
+#    {{ data_dir }}/logs/apt-upgrade-YYYYMMDD-HHMMSS.log — persistent,
+#    survives container rebuilds, viewable from any device with access
+#    to shared storage (e.g. plug the phone into a computer, or browse
+#    via a file manager app).
+#
+# 3. This handles in-place userspace patching only. Pair it with the
+#    periodic destroy-and-rebuild cadence discussed earlier (monthly-ish,
+#    via proot-bootstrap.yml) to catch base-image drift and config rot
+#    that in-place upgrades won't fix.
