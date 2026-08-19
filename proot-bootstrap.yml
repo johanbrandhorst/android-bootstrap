@@ -128,6 +128,7 @@
         repo: "{{ config_repo }}"
         dest: /data/configs
         version: "{{ config_repo_branch }}"
+        accept_newhostkey: true
       when: config_repo | length > 0 and data_mount.stat.exists
       become: false
       become_user: "{{ target_user }}"
