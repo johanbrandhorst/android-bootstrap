@@ -126,7 +126,7 @@
     - name: Clone or update config repo into persistent storage
       ansible.builtin.git:
         repo: "{{ config_repo }}"
-        dest: /data/configs
+        dest: /data/configs/android-bootstrap
         version: "{{ config_repo_branch }}"
         accept_newhostkey: true
       when: config_repo | length > 0 and data_mount.stat.exists
@@ -135,7 +135,7 @@
 
     - name: Symlink config repo into admin user's home
       ansible.builtin.file:
-        src: /data/configs
+        src: /data/configs/android-bootstrap
         dest: "/home/{{ target_user }}/configs"
         state: link
       when: config_repo | length > 0 and data_mount.stat.exists
